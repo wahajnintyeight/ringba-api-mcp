@@ -1,8 +1,9 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
-import path from "node:path";
+import path, { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
+import { google, sheets_v4 } from "googleapis";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
@@ -255,6 +256,18 @@ const MCP_PATH = process.env.MCP_PATH ?? "/mcp";
 
 const RINGBA_INSIGHTS_URL = `https://api.ringba.com/v2/${RINGBA_ACCOUNT_ID}/insights`;
 
+// Google Sheets config
+const GOOGLE_SHEET_ID =
+  process.env.GOOGLE_SHEET_ID ??
+  "1J8Wos5UGnXklqW7lMBSemJPRG_q59XDepYB1oKn_AYc";
+const GOOGLE_READONLY_SCOPE =
+  "https://www.googleapis.com/auth/spreadsheets.readonly";
+const GOOGLE_READWRITE_SCOPE =
+  "https://www.googleapis.com/auth/spreadsheets";
+
+// Google Sheets client (lazy init)
+let _sheetsClient: sheets_v4.Sheets | null = null;
+
 // ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------
@@ -361,6 +374,7 @@ function createMcpServer() {
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
+      // --- Ringba insights tools ---
       {
         name: "ringba_insights",
         description:
@@ -468,6 +482,84 @@ function createMcpServer() {
           },
         },
       },
+
+      // --- Google Sheets tools ---
+      {
+        name: "gsheet_list_tabs",
+        description:
+          "List all tabs in the configured Google Sheet along with their " +
+          "gid and row count. Useful to discover available tabs before reading.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "gsheet_read",
+        description:
+          "Read data from a tab in the configured Google Sheet. " +
+          "Returns rows as JSON objects keyed by column headers. " +
+          "Defaults to the '2026' tab. " +
+          "When normalizeCounts is true (default), any Count value of 0.5 " +
+          "(split commission) is treated as 1.0 (full sale).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            tabName: {
+              type: "string",
+              description:
+                "Tab name to read from. Default: 2026.",
+            },
+            range: {
+              type: "string",
+              description:
+                "A1 notation range, e.g. A1:Z500. If omitted, reads the entire sheet.",
+            },
+            normalizeCounts: {
+              type: "boolean",
+              description:
+                "When true, normalizes Count column values of 0.5 to 1.0. " +
+                "Default: true.",
+            },
+            headerRow: {
+              type: "number",
+              description:
+                "Row number (1-based) that contains column headers. Default: 1.",
+            },
+          },
+        },
+      },
+      {
+        name: "gsheet_append",
+        description:
+          "Append rows to a tab in the configured Google Sheet. " +
+          "Rows can be passed as an array of arrays or an array of objects. " +
+          "When normalizeCounts is true (default), any Count of 0.5 is " +
+          "written as 1.0.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            tabName: {
+              type: "string",
+              description: "Tab name to append to, e.g. '2026'.",
+            },
+            rows: {
+              type: "array",
+              items: { type: "object" },
+              description:
+                "Array of rows to append. Each row can be an array of values " +
+                "or an object keyed by column headers.",
+            },
+            normalizeCounts: {
+              type: "boolean",
+              description:
+                "When true, normalizes Count values of 0.5 to 1.0 before writing. " +
+                "Default: true.",
+            },
+          },
+          required: ["tabName", "rows"],
+        },
+      },
     ],
   }));
 
@@ -477,11 +569,22 @@ function createMcpServer() {
       const args = (rawArgs ?? {}) as Record<string, unknown>;
 
       switch (name) {
+        // --- Ringba tools ---
         case "ringba_insights":
           return await handleRingbaInsights(args);
 
         case "ringba_list_available_columns":
           return handleListAvailableColumns(args);
+
+        // --- Google Sheets tools ---
+        case "gsheet_list_tabs":
+          return await handleGsheetListTabs();
+
+        case "gsheet_read":
+          return await handleGsheetRead(args);
+
+        case "gsheet_append":
+          return await handleGsheetAppend(args);
 
         default:
           throw new Error(`Unknown tool: ${name}`);
@@ -498,7 +601,7 @@ function createMcpServer() {
 }
 
 // ---------------------------------------------------------------------------
-// Tool handlers
+// Tool handlers — Ringba
 // ---------------------------------------------------------------------------
 
 async function handleRingbaInsights(args: Record<string, unknown>) {
@@ -508,12 +611,10 @@ async function handleRingbaInsights(args: Record<string, unknown>) {
   const groupByDisplayName =
     optionalString(args.groupByDisplayName) ?? groupByColumn;
 
-  // Build groupByColumns array
   const groupByColumns = [
     { column: groupByColumn, displayName: groupByDisplayName },
   ];
 
-  // Build valueColumns array
   const rawValueColumns = args.valueColumns as string[] | undefined;
   const valueColumnNames =
     rawValueColumns && rawValueColumns.length > 0
@@ -524,14 +625,12 @@ async function handleRingbaInsights(args: Record<string, unknown>) {
     aggregateFunction: null,
   }));
 
-  // Build orderByColumns
   const orderByColumn = optionalString(args.orderByColumn) ?? "callCount";
   const orderDirection = optionalString(args.orderDirection) ?? "desc";
   const orderByColumns = [
     { column: orderByColumn, direction: orderDirection },
   ];
 
-  // Optional parameters with defaults
   const filters = (args.filters as Record<string, unknown>[]) ?? [];
   const maxResultsPerGroup =
     (args.maxResultsPerGroup as number) ?? 1000;
@@ -556,13 +655,15 @@ async function handleRingbaInsights(args: Record<string, unknown>) {
   };
 
   console.log(
-    `[ringba_insights] ${reportStart} → ${reportEnd} grouped by ${groupByColumn}`,
+    `[ringba_insights] ${reportStart} ... ${reportEnd} grouped by ${groupByColumn}`,
   );
 
   const apiResponse = await callRingbaApi(RINGBA_INSIGHTS_URL, requestBody);
 
   const responseData =
-    apiResponse && typeof apiResponse === "object" ? apiResponse : { raw: apiResponse };
+    apiResponse && typeof apiResponse === "object"
+      ? apiResponse
+      : { raw: apiResponse };
 
   return toTextResult({
     request: {
@@ -595,6 +696,293 @@ function handleListAvailableColumns(args: Record<string, unknown>) {
       description: c.description,
     })),
   });
+}
+
+// ---------------------------------------------------------------------------
+// Tool handlers — Google Sheets
+// ---------------------------------------------------------------------------
+
+async function handleGsheetListTabs() {
+  const sheets = getSheetsClient();
+  const ss = await sheets.spreadsheets.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    fields: "sheets.properties",
+  });
+
+  const tabs = (ss.data.sheets ?? []).map((s) => ({
+    tabName: s.properties?.title ?? "",
+    gid: s.properties?.sheetId,
+    rowCount: s.properties?.gridProperties?.rowCount,
+    columnCount: s.properties?.gridProperties?.columnCount,
+  }));
+
+  return toTextResult({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    tabCount: tabs.length,
+    tabs,
+  });
+}
+
+async function handleGsheetRead(args: Record<string, unknown>) {
+  const tabName = optionalString(args.tabName) ?? "2026";
+  const normalizeCounts = (args.normalizeCounts as boolean) ?? true;
+  const headerRow = (args.headerRow as number) ?? 1;
+
+  // Resolve the tab to get its gid and construct a range
+  const tabInfo = await resolveTab(tabName);
+  const range = optionalString(args.range) ?? tabInfo.defaultRange;
+
+  const sheets = getSheetsClient();
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `'${tabName}'!${range}`,
+  });
+
+  const values = res.data.values;
+  if (!values || values.length === 0) {
+    return toTextResult({
+      tabName,
+      rowCount: 0,
+      headers: [],
+      rows: [],
+    });
+  }
+
+  // Extract headers and data rows
+  const headerRowIndex = headerRow - 1;
+  const rawHeaders = values[headerRowIndex] ?? [];
+  const headers = rawHeaders.map((h) =>
+    h === null || h === undefined ? "" : String(h).trim(),
+  );
+  const dataRows = values.slice(headerRowIndex + 1);
+
+  // Find Count column index for normalization
+  const countColIndex = headers.findIndex(
+    (h: string) => h.toLowerCase() === "count",
+  );
+
+  // Convert rows to objects
+  const rows = dataRows
+    .filter((row) => row.some((cell: unknown) => cell !== "" && cell !== null))
+    .map((row) => {
+      const obj: Record<string, string> = {};
+      for (let i = 0; i < headers.length; i++) {
+        const header = headers[i];
+        if (!header) continue;
+        let value = row[i] === null || row[i] === undefined ? "" : String(row[i]);
+
+        // Normalize Count 0.5 → 1.0
+        if (
+          normalizeCounts &&
+          i === countColIndex &&
+          (value === "0.5" || value === "0.50" || value === ".5")
+        ) {
+          value = "1.00";
+        }
+
+        obj[header] = value;
+      }
+      return obj;
+    });
+
+  return toTextResult({
+    tabName,
+    gid: tabInfo.gid,
+    headerRow,
+    normalizeCounts,
+    rowCount: rows.length,
+    headers,
+    rows,
+  });
+}
+
+async function handleGsheetAppend(args: Record<string, unknown>) {
+  const tabName = requiredString(args.tabName, "tabName");
+  const rawRows = args.rows as (Record<string, unknown> | unknown[])[] | undefined;
+  const normalizeCounts = (args.normalizeCounts as boolean) ?? true;
+
+  if (!rawRows || !Array.isArray(rawRows) || rawRows.length === 0) {
+    throw new Error("rows is required and must be a non-empty array.");
+  }
+
+  // Read current headers from the sheet so we can map objects to column order
+  const tabInfo = await resolveTab(tabName);
+  const sheets = getSheetsClient();
+
+  const headerRes = await sheets.spreadsheets.values.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `'${tabName}'!1:1`,
+  });
+  const headers =
+    headerRes.data.values?.[0]?.map((h) =>
+      h === null || h === undefined ? "" : String(h).trim(),
+    ) ?? [];
+
+  // Convert rows to arrays of strings aligned with headers
+  const countColIndex = headers.findIndex(
+    (h: string) => h.toLowerCase() === "count",
+  );
+
+  const values = rawRows.map((row) => {
+    let rowArray: string[];
+
+    if (Array.isArray(row)) {
+      rowArray = row.map((cell) =>
+        cell === null || cell === undefined ? "" : String(cell),
+      );
+    } else {
+      // Map object keys to header positions
+      rowArray = headers.map((header) => {
+        if (!header) return "";
+        const val = (row as Record<string, unknown>)[header];
+        return val === null || val === undefined ? "" : String(val);
+      });
+    }
+
+    // Normalize Count 0.5 → 1.0
+    if (
+      normalizeCounts &&
+      countColIndex >= 0 &&
+      countColIndex < rowArray.length
+    ) {
+      const v = rowArray[countColIndex].trim();
+      if (v === "0.5" || v === "0.50" || v === ".5") {
+        rowArray[countColIndex] = "1.00";
+      }
+    }
+
+    return rowArray;
+  });
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `'${tabName}'!A1`,
+    valueInputOption: "USER_ENTERED",
+    requestBody: { values },
+  });
+
+  return toTextResult({
+    tabName,
+    appendedRows: values.length,
+    normalizeCounts,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Google Sheets helpers
+// ---------------------------------------------------------------------------
+
+interface TabInfo {
+  gid: number | null | undefined;
+  defaultRange: string;
+}
+
+const _tabCache = new Map<string, TabInfo>();
+
+async function resolveTab(tabName: string): Promise<TabInfo> {
+  if (_tabCache.has(tabName)) {
+    return _tabCache.get(tabName)!;
+  }
+
+  const sheets = getSheetsClient();
+  const ss = await sheets.spreadsheets.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    fields: "sheets.properties",
+  });
+
+  for (const s of ss.data.sheets ?? []) {
+    const title = s.properties?.title ?? "";
+    if (title.toLowerCase() === tabName.toLowerCase()) {
+      const rowCount = s.properties?.gridProperties?.rowCount ?? 1000;
+      const colCount = s.properties?.gridProperties?.columnCount ?? 26;
+      const colLetter = colCount <= 26
+        ? String.fromCharCode(64 + colCount)
+        : "Z";
+      const info: TabInfo = {
+        gid: s.properties?.sheetId,
+        defaultRange: `A1:${colLetter}${rowCount}`,
+      };
+      _tabCache.set(tabName, info);
+      return info;
+    }
+  }
+
+  throw new Error(
+    `Tab "${tabName}" not found in sheet ${GOOGLE_SHEET_ID}. ` +
+    `Use gsheet_list_tabs to see available tabs.`,
+  );
+}
+
+function loadGoogleCredentials(): Record<string, unknown> {
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (!raw?.trim()) {
+    throw new Error(
+      "GOOGLE_SERVICE_ACCOUNT_JSON is not configured. " +
+      "Set it in .env as inline JSON or a path to a service-account key file.",
+    );
+  }
+
+  const trimmed = raw.trim();
+
+  // Inline JSON
+  if (trimmed.startsWith("{")) {
+    try {
+      return JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      throw new Error(
+        "GOOGLE_SERVICE_ACCOUNT_JSON contains invalid inline JSON.",
+      );
+    }
+  }
+
+  // File path — resolve relative to multiple roots
+  if (isAbsolute(trimmed) && existsSync(trimmed)) {
+    return parseServiceAccountFile(trimmed);
+  }
+
+  const candidates = [
+    join(process.cwd(), trimmed),                          // cwd
+    path.resolve(projectRoot, "..", "RingbaApi", trimmed), // ../RingbaApi from MCP root
+    join(projectRoot, trimmed),                            // MCP project root
+  ];
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return parseServiceAccountFile(candidate);
+    }
+  }
+
+  throw new Error(
+    `GOOGLE_SERVICE_ACCOUNT_JSON file not found. ` +
+    `Tried: ${candidates.join(", ")}`,
+  );
+}
+
+function parseServiceAccountFile(filePath: string): Record<string, unknown> {
+  try {
+    const jsonText = readFileSync(filePath, "utf8");
+    return JSON.parse(jsonText) as Record<string, unknown>;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `GOOGLE_SERVICE_ACCOUNT_JSON could not read file: ${detail}`,
+    );
+  }
+}
+
+function getSheetsClient(): sheets_v4.Sheets {
+  // Return cached client (per-process) so we don't re-auth on every call.
+  // Each HTTP request creates a fresh server, but the module-level cache
+  // survives across requests in the same process.
+  if (_sheetsClient) return _sheetsClient;
+
+  const credentials = loadGoogleCredentials();
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: [GOOGLE_READONLY_SCOPE, GOOGLE_READWRITE_SCOPE],
+  });
+  _sheetsClient = google.sheets({ version: "v4", auth });
+  return _sheetsClient;
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +1035,7 @@ function validateEnv() {
   if (!RINGBA_API_TOKEN) {
     throw new Error("RINGBA_API_TOKEN is required. Set it in .env.");
   }
+  // Google Sheets creds are validated lazily on first gsheet_* call
 }
 
 function requiredString(value: unknown, name: string): string {
