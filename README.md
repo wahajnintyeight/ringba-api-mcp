@@ -16,6 +16,182 @@ npm start
 The server listens on `http://0.0.0.0:3031/mcp-ringba` by default. Point your
 MCP client at that URL.
 
+## Client Setup Guides
+
+All clients below assume the server is running. Start it first:
+
+```bash
+npm start
+```
+
+For production use, run it under a process manager (PM2, systemd, launchd,
+or a simple `nohup` / background task).
+
+---
+
+### Claude Code (CLI)
+
+Add this to your Claude Code settings. The location depends on your scope:
+
+| Scope | Path |
+|-------|------|
+| User (all projects) | `~/.claude/settings.json` |
+| Project (this repo only) | `.claude/settings.json` |
+
+```json
+{
+  "mcpServers": {
+    "ringba-api": {
+      "type": "http",
+      "url": "http://localhost:3031/mcp-ringba"
+    }
+  }
+}
+```
+
+Restart Claude Code or run `/mcp` to verify the server is connected.
+
+The `ringba_insights` and `ringba_list_available_columns` tools will appear
+in Claude's tool list automatically.
+
+---
+
+### Claude Desktop
+
+Claude Desktop supports HTTP MCP servers directly. Open the config file:
+
+| OS | Path |
+|----|------|
+| macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
+| Linux | `~/.config/Claude/claude_desktop_config.json` |
+
+```json
+{
+  "mcpServers": {
+    "ringba-api": {
+      "type": "http",
+      "url": "http://localhost:3031/mcp-ringba"
+    }
+  }
+}
+```
+
+Restart Claude Desktop after saving. The Ringba tools will be listed under
+the tools panel (hammer icon) in the chat input.
+
+---
+
+### Cursor
+
+Create or edit `.cursor/mcp.json` in your project root:
+
+```json
+{
+  "mcpServers": {
+    "ringba-api": {
+      "url": "http://localhost:3031/mcp-ringba"
+    }
+  }
+}
+```
+
+You can also place this at `~/.cursor/mcp.json` for global access across all
+projects. Restart Cursor after adding the configuration.
+
+Cursor discovers MCP tools automatically; use Cmd/Ctrl+I to open Composer
+and the tools will be available.
+
+---
+
+### GitHub Copilot (VS Code / VS Code Insiders)
+
+GitHub Copilot supports MCP servers through the `.vscode/mcp.json` file
+(VS Code 1.99+ with Copilot Chat). Create it in your project root:
+
+```json
+{
+  "servers": {
+    "ringba-api": {
+      "type": "http",
+      "url": "http://localhost:3031/mcp-ringba"
+    }
+  }
+}
+```
+
+After saving, open the Copilot Chat panel. Copilot will auto-discover the
+MCP tools on the next prompt.
+
+---
+
+### Codex (OpenAI)
+
+Codex supports MCP via its agent configuration. Add a server entry in your
+Codex config file (`~/.codex/config.toml` or project `.codex.toml`):
+
+```toml
+[mcp_servers.ringba-api]
+url = "http://localhost:3031/mcp-ringba"
+```
+
+If running Codex in a container or remote environment, replace `localhost`
+with the host machine's reachable IP.
+
+---
+
+### Windsurf
+
+Create or edit `.windsurf/mcp.json` in your project:
+
+```json
+{
+  "mcpServers": {
+    "ringba-api": {
+      "url": "http://localhost:3031/mcp-ringba"
+    }
+  }
+}
+```
+
+Use Cascade (Cmd+L) after restart — the tools will be available to the agent.
+
+---
+
+### Continue (VS Code / JetBrains extension)
+
+Add to `~/.continue/config.json` under the `mcpServers` key:
+
+```json
+{
+  "mcpServers": [
+    {
+      "name": "ringba-api",
+      "transport": "http",
+      "url": "http://localhost:3031/mcp-ringba"
+    }
+  ]
+}
+```
+
+Continue will connect on the next chat session.
+
+---
+
+### Generic / Other Clients
+
+This server speaks standard JSON-RPC 2.0 over Streamable HTTP at the
+configured `MCP_PATH`. Any MCP-compatible client that supports the
+`streamable-http` transport can connect.
+
+| Transport detail | Value |
+|------------------|-------|
+| Protocol | JSON-RPC 2.0 |
+| Transport | Streamable HTTP (SSE) |
+| Endpoint | `http://<host>:<port>/mcp-ringba` |
+| Methods | `tools/list`, `tools/call` |
+| Auth | None on the MCP layer (Ringba API auth is server-side) |
+
 ## Architecture
 
 ```
