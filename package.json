@@ -1,0 +1,20 @@
+{
+  "name": "ringba-api-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MCP server for Ringba APIs — EHG insights reports and future Ringba API endpoints",
+  "type": "module",
+  "main": "build/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node build/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "dotenv": "^16.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.3",
+    "typescript": "^5.8.3"
+  }
+}
