@@ -500,8 +500,8 @@ function createMcpServer() {
           "Read data from a tab in the configured Google Sheet. " +
           "Returns rows as JSON objects keyed by column headers. " +
           "Defaults to the '2026' tab. " +
-          "When normalizeCounts is true (default), any Count value of 0.5 " +
-          "(split commission) is treated as 1.0 (full sale).",
+          "normalizeCounts defaults to false so Count values are preserved as " +
+          "stored in the sheet.",
         inputSchema: {
           type: "object",
           properties: {
@@ -519,7 +519,7 @@ function createMcpServer() {
               type: "boolean",
               description:
                 "When true, normalizes Count column values of 0.5 to 1.0. " +
-                "Default: true.",
+                "Default: false.",
             },
             headerRow: {
               type: "number",
@@ -534,8 +534,8 @@ function createMcpServer() {
         description:
           "Append rows to a tab in the configured Google Sheet. " +
           "Rows can be passed as an array of arrays or an array of objects. " +
-          "When normalizeCounts is true (default), any Count of 0.5 is " +
-          "written as 1.0.",
+          "normalizeCounts defaults to false so Count values are written as " +
+          "provided.",
         inputSchema: {
           type: "object",
           properties: {
@@ -554,7 +554,7 @@ function createMcpServer() {
               type: "boolean",
               description:
                 "When true, normalizes Count values of 0.5 to 1.0 before writing. " +
-                "Default: true.",
+                "Default: false.",
             },
           },
           required: ["tabName", "rows"],
@@ -725,7 +725,7 @@ async function handleGsheetListTabs() {
 
 async function handleGsheetRead(args: Record<string, unknown>) {
   const tabName = optionalString(args.tabName) ?? "2026";
-  const normalizeCounts = (args.normalizeCounts as boolean) ?? true;
+  const normalizeCounts = (args.normalizeCounts as boolean) ?? false;
   const headerRow = (args.headerRow as number) ?? 1;
 
   // Resolve the tab to get its gid and construct a range
@@ -771,7 +771,7 @@ async function handleGsheetRead(args: Record<string, unknown>) {
         if (!header) continue;
         let value = row[i] === null || row[i] === undefined ? "" : String(row[i]);
 
-        // Normalize Count 0.5 → 1.0
+        // Preserve raw Count values unless the caller explicitly opts in.
         if (
           normalizeCounts &&
           i === countColIndex &&
@@ -799,7 +799,7 @@ async function handleGsheetRead(args: Record<string, unknown>) {
 async function handleGsheetAppend(args: Record<string, unknown>) {
   const tabName = requiredString(args.tabName, "tabName");
   const rawRows = args.rows as (Record<string, unknown> | unknown[])[] | undefined;
-  const normalizeCounts = (args.normalizeCounts as boolean) ?? true;
+  const normalizeCounts = (args.normalizeCounts as boolean) ?? false;
 
   if (!rawRows || !Array.isArray(rawRows) || rawRows.length === 0) {
     throw new Error("rows is required and must be a non-empty array.");
@@ -839,7 +839,7 @@ async function handleGsheetAppend(args: Record<string, unknown>) {
       });
     }
 
-    // Normalize Count 0.5 → 1.0
+    // Preserve raw Count values unless the caller explicitly opts in.
     if (
       normalizeCounts &&
       countColIndex >= 0 &&
